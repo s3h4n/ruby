@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ruby.core.conversation import ConversationManager
 from ruby.core.errors import RubyError
+from ruby.core.markdown_speech import markdown_to_speech_text
 from ruby.core.pipeline import AssistantPipeline, build_system_prompt
 from ruby.core.schemas import AssistantResponse
 from ruby.providers.llm.base import LLMProvider
@@ -101,7 +102,7 @@ class RubyAssistant:
 
     def _safe_synthesize(self, text: str) -> tuple[str, str]:
         try:
-            audio_path = self._synthesize(text)
+            audio_path = self._synthesize(markdown_to_speech_text(text))
             return str(audio_path), ""
         except RubyError:
             return "", "Text response generated, but speech failed."
