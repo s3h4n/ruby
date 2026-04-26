@@ -1,0 +1,53 @@
+## Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+## Virtual environment
+.venv/
+venv/
+env/
+
+## Environment variables (secrets)
+.env
+.env.local
+.env.*.local
+
+## Local config (contains machine-specific paths)
+config.json
+
+## macOS
+.DS_Store
+
+## Logs
+*.log
+
+## Audio files (generated)
+recordings/
+responses/
+
+## Workspace files
+ruby_workspace/
+
+## Local whisper.cpp checkout/build assets
+whisper.cpp/
+
+## Node / frontend (future)
+node_modules/
+dist/
+build/
+
+## IDE files
+.vscode/
+.idea/
+
+## Temporary
+*.tmp
+*.swp
+
+## Test/build caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
