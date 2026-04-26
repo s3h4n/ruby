@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from datetime import datetime
+import json
 from pathlib import Path
+import re
+import threading
 
 from ruby.core.conversation import ConversationManager
 from ruby.core.errors import RubyError
 from ruby.core.markdown_speech import markdown_to_speech_text
-from ruby.core.pipeline import AssistantPipeline, build_system_prompt
+from ruby.core.pipeline import (
+    AssistantPipeline,
+    build_system_prompt,
+    build_voice_system_prompt,
+)
 from ruby.core.schemas import AssistantResponse
 from ruby.providers.llm.base import LLMProvider
 from ruby.providers.stt.base import STTProvider
 from ruby.providers.tts.base import TTSProvider
 from ruby.tools.registry import ToolRegistry
+
+
+_ACK_FALLBACK = "Okay, working on that."
+_ACK_MAX_WORDS = 14
 
 
 class RubyAssistant:
@@ -36,12 +48,14 @@ class RubyAssistant:
         self.tool_registry = tool_registry
         self.pipeline = AssistantPipeline(tool_registry=tool_registry)
         self.system_prompt = build_system_prompt(tool_registry=tool_registry)
+        self.voice_system_prompt = build_voice_system_prompt(tool_registry=tool_registry)
         self.responses_dir = responses_dir
         self.responses_dir.mkdir(parents=True, exist_ok=True)
         self.conversation = ConversationManager(
             enabled=conversation_enabled,
             max_turns=conversation_max_turns,
         )
+        self._last_acknowledgement: str | None = None
 
     def handle_text(self, user_text: str) -> AssistantResponse:
         cleaned = user_text.strip()
@@ -94,6 +108,149 @@ class RubyAssistant:
 
     def clear_conversation(self) -> None:
         self.conversation.clear()
+
+    def should_acknowledge_for_voice(self, user_text: str) -> bool:
+        cleaned = user_text.strip().lower()
+        if not cleaned:
+            return False
+        if len(cleaned.split()) >= 12:
+            return True
+
+        long_task_hints = (
+            "create",
+            "write",
+            "draft",
+            "generate",
+            "build",
+            "search",
+            "find",
+            "analyze",
+            "summarize",
+            "plan",
+            "open",
+            "run",
+            "fix",
+            "update",
+            "refactor",
+        )
+        return any(hint in cleaned for hint in long_task_hints)
+
+    def acknowledgement_for_voice(self, user_text: str) -> str:
+        cleaned_user_text = user_text.strip()
+        prompt_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You generate quick spoken acknowledgements before longer tasks. "
+                    "Return a single short sentence only (5-14 words), plain text, no lists."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Create a brief acknowledgement for this request before the assistant starts working: "
+                    f"{cleaned_user_text}"
+                ),
+            },
+        ]
+
+        raw_phrase = ""
+        try:
+            raw_phrase = self.llm_provider.chat(prompt_messages)
+        except RubyError:
+            raw_phrase = ""
+
+        phrase = self._normalize_acknowledgement(raw_phrase)
+        if not phrase:
+            phrase = _ACK_FALLBACK
+
+        if self._last_acknowledgement is not None and phrase.lower() == self._last_acknowledgement.lower():
+            phrase = f"{phrase.rstrip('.')} now."
+
+        self._last_acknowledgement = phrase
+        return phrase
+
+    @staticmethod
+    def _normalize_acknowledgement(raw_text: str) -> str:
+        candidate = raw_text.strip()
+        if not candidate:
+            return ""
+
+        if candidate.startswith("{"):
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                maybe_text = payload.get("text") or payload.get("content")
+                if isinstance(maybe_text, str):
+                    candidate = maybe_text.strip()
+
+        candidate = markdown_to_speech_text(candidate)
+        candidate = re.sub(r"\s+", " ", candidate).strip().strip('"')
+        if not candidate:
+            return ""
+
+        first_line = candidate.splitlines()[0].strip()
+        sentence_match = re.search(r"[.!?]", first_line)
+        if sentence_match is not None:
+            first_line = first_line[: sentence_match.end()]
+
+        words = first_line.split()
+        if len(words) > _ACK_MAX_WORDS:
+            first_line = " ".join(words[:_ACK_MAX_WORDS]).rstrip(".,!?") + "."
+
+        if not first_line.endswith((".", "!", "?")):
+            first_line = first_line.rstrip(".,!?") + "."
+
+        return first_line
+
+    def stream_voice_response(
+        self,
+        user_text: str,
+        *,
+        cancel_event: threading.Event | None = None,
+        on_first_token: Callable[[float], None] | None = None,
+    ) -> Iterator[str]:
+        cleaned = user_text.strip()
+        if not cleaned:
+            return
+
+        blocked_reason = _blocked_request_reason(cleaned)
+        if blocked_reason:
+            refusal = (
+                "I can't help with that in v1. "
+                f"Reason: {blocked_reason}. "
+                "I can only run safe local tools."
+            )
+            yield refusal
+            return
+
+        messages = self.conversation.get_messages(self.voice_system_prompt, cleaned)
+        yield from self.llm_provider.stream_chat(
+            messages,
+            on_first_token=on_first_token,
+            cancel_event=cancel_event,
+        )
+
+    def finalize_voice_turn(
+        self,
+        transcript: str,
+        final_text: str,
+        *,
+        interrupted: bool,
+    ) -> AssistantResponse:
+        cleaned = transcript.strip()
+        response_text = final_text.strip() or "I am ready."
+        if cleaned:
+            self.conversation.add_user_message(cleaned)
+        if not interrupted and response_text:
+            self.conversation.add_assistant_message(response_text)
+        return AssistantResponse(
+            type="answer",
+            text=response_text,
+            transcript=cleaned,
+        )
 
     def _synthesize(self, text: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")

@@ -41,6 +41,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "audio": {
         "sample_rate": 16000,
         "record_seconds": 5,
+        "barge_in_enabled": True,
+        "barge_in_energy_threshold": 0.01,
+        "latency_debug": False,
+        "min_chunk_words": 3,
+        "max_chunk_words": 20,
+        "max_chunk_wait_ms": 700,
         "wake_word_enabled": True,
         "wake_threshold": 0.08,
         "wake_chunk_size": 1024,
@@ -112,6 +118,12 @@ class ProvidersConfig:
 class AudioConfig:
     sample_rate: int
     record_seconds: int
+    barge_in_enabled: bool
+    barge_in_energy_threshold: float
+    latency_debug: bool
+    min_chunk_words: int
+    max_chunk_words: int
+    max_chunk_wait_ms: int
     wake_word_enabled: bool
     wake_threshold: float
     wake_chunk_size: int
@@ -351,7 +363,15 @@ def load_settings(
         ),
         audio=AudioConfig(
             sample_rate=int(_require(audio_raw, "sample_rate", "audio")),
-            record_seconds=int(_require(audio_raw, "record_seconds", "audio")),
+            record_seconds=_require_positive_int(audio_raw, "record_seconds", "audio"),
+            barge_in_enabled=_require_bool(audio_raw, "barge_in_enabled", "audio"),
+            barge_in_energy_threshold=float(
+                _require(audio_raw, "barge_in_energy_threshold", "audio")
+            ),
+            latency_debug=_require_bool(audio_raw, "latency_debug", "audio"),
+            min_chunk_words=_require_positive_int(audio_raw, "min_chunk_words", "audio"),
+            max_chunk_words=_require_positive_int(audio_raw, "max_chunk_words", "audio"),
+            max_chunk_wait_ms=_require_positive_int(audio_raw, "max_chunk_wait_ms", "audio"),
             wake_word_enabled=bool(_require(audio_raw, "wake_word_enabled", "audio")),
             wake_threshold=float(_require(audio_raw, "wake_threshold", "audio")),
             wake_chunk_size=int(_require(audio_raw, "wake_chunk_size", "audio")),
@@ -384,6 +404,16 @@ def load_settings(
             allowed_apps=dict(_require(tools_raw, "allowed_apps", "tools")),
         ),
     )
+    if settings.audio.max_chunk_words < settings.audio.min_chunk_words:
+        raise ConfigError(
+            "Invalid chunk configuration in 'audio'. "
+            "Expected max_chunk_words to be greater than or equal to min_chunk_words."
+        )
+    if settings.audio.barge_in_energy_threshold <= 0:
+        raise ConfigError(
+            "Invalid 'barge_in_energy_threshold' in config section 'audio'. "
+            "Expected a value greater than 0."
+        )
     return settings
 
 

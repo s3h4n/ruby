@@ -14,6 +14,7 @@ from ruby.tools.registry import ToolRegistry
 FALLBACK_UNSUPPORTED_INTENT = "That intent is not implemented yet."
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SYSTEM_PROMPT_PATH = PROJECT_ROOT / "prompts" / "system_prompt.md"
+DEFAULT_VOICE_SYSTEM_PROMPT_PATH = PROJECT_ROOT / "prompts" / "voice_system_prompt.md"
 
 
 def _extract_json_candidate(raw_text: str) -> str:
@@ -78,6 +79,16 @@ def build_system_prompt(
     prompt_path: Path | None = None,
 ) -> str:
     prompt_template = _load_system_prompt_template(prompt_path or DEFAULT_SYSTEM_PROMPT_PATH)
+    tools_description = tool_registry.describe_enabled_tools() or "- No tools are enabled."
+    return prompt_template.replace("{{enabled_tools}}", tools_description)
+
+
+def build_voice_system_prompt(
+    tool_registry: ToolRegistry,
+    *,
+    prompt_path: Path | None = None,
+) -> str:
+    prompt_template = _load_system_prompt_template(prompt_path or DEFAULT_VOICE_SYSTEM_PROMPT_PATH)
     tools_description = tool_registry.describe_enabled_tools() or "- No tools are enabled."
     return prompt_template.replace("{{enabled_tools}}", tools_description)
 

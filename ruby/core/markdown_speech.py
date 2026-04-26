@@ -6,11 +6,21 @@ import re
 
 
 _LINK_PATTERN = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_BRACKETED_TEXT_PATTERN = re.compile(r"\[([^\]]+)\]")
 _INLINE_CODE_PATTERN = re.compile(r"`([^`]+)`")
-_BOLD_ITALIC_PATTERN = re.compile(r"(\*\*|__|\*|_)([^\n]+?)\1")
+_BOLD_ITALIC_PATTERN = re.compile(r"(\*\*|__|\*)([^\n]+?)\1")
+_ITALIC_UNDERSCORE_PATTERN = re.compile(r"(?<!\w)_([^\n]+?)_(?!\w)")
 _HEADING_PATTERN = re.compile(r"^\s{0,3}#{1,6}\s+")
 _ORDERED_LIST_PATTERN = re.compile(r"^\s*(\d+)\.\s+")
 _UNORDERED_LIST_PATTERN = re.compile(r"^\s*[-*+]\s+")
+_UNDERSCORE_PATTERN = re.compile(r"(?<=\w)_(?=\w)")
+_SNAKE_CALL_PATTERN = re.compile(r"\b([A-Za-z]+(?:_[A-Za-z0-9]+)+)\(\)")
+_OPERATOR_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    ("<->", " then "),
+    ("->", " then "),
+    ("=>", " then "),
+    ("<-", " then "),
+)
 
 
 def markdown_to_speech_text(markdown: str) -> str:
@@ -59,6 +69,7 @@ def markdown_to_speech_text(markdown: str) -> str:
         normalized = _LINK_PATTERN.sub(r"\1", normalized)
         normalized = _INLINE_CODE_PATTERN.sub(r"\1", normalized)
         normalized = _BOLD_ITALIC_PATTERN.sub(r"\2", normalized)
+        normalized = _ITALIC_UNDERSCORE_PATTERN.sub(r"\1", normalized)
 
         if _UNORDERED_LIST_PATTERN.match(normalized):
             normalized = _UNORDERED_LIST_PATTERN.sub("", normalized)
@@ -69,7 +80,27 @@ def markdown_to_speech_text(markdown: str) -> str:
 
     compact = "\n".join(rendered)
     compact = re.sub(r"\n{3,}", "\n\n", compact)
-    return compact.strip()
+    return _normalize_symbols_for_speech(compact)
+
+
+def _normalize_symbols_for_speech(text: str) -> str:
+    normalized = text
+
+    for source, target in _OPERATOR_REPLACEMENTS:
+        normalized = normalized.replace(source, target)
+
+    normalized = normalized.replace("+", " plus ")
+    normalized = normalized.replace("=", " equals ")
+    normalized = normalized.replace("\\", " ")
+    normalized = normalized.replace("/", " ")
+
+    normalized = _BRACKETED_TEXT_PATTERN.sub(r"\1", normalized)
+    normalized = _SNAKE_CALL_PATTERN.sub(r"\1", normalized)
+    normalized = _UNDERSCORE_PATTERN.sub(" ", normalized)
+
+    normalized = re.sub(r"[{}\[\]]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
 
 
 def _looks_like_table_separator(line: str) -> bool:

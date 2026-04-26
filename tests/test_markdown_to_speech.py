@@ -66,3 +66,20 @@ def test_mixed_markdown_is_handled_in_single_pass() -> None:
     assert "Plan" in spoken
     assert "docs" in spoken
     assert "python app.py run" in spoken
+
+
+def test_symbol_heavy_text_is_normalized_for_tts() -> None:
+    spoken = markdown_to_speech_text(
+        "Move -> Jump -> attack. Try queue_entry() and 2 + 2 = 4; use [fast_mode] and a\\b."
+    )
+
+    assert "->" not in spoken
+    assert "_" not in spoken
+    assert "(" not in spoken
+    assert ")" not in spoken
+    assert "[" not in spoken
+    assert "]" not in spoken
+    assert "\\" not in spoken
+    assert "plus" in spoken
+    assert "equals" in spoken
+    assert "then" in spoken
