@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import re
 import select
 import sys
 import threading
 import time
+import wave
 import warnings
 from collections.abc import Callable
 from datetime import datetime
@@ -23,6 +26,8 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 from ruby.app import AppContext, PROJECT_ROOT, build_app_context, dump_settings_snapshot
 from ruby.config.settings import DEFAULT_CONFIG_PATH, get_env_status, load_settings
 from ruby.core.errors import RubyError, StartupCheckError
+from ruby.core.markdown_speech import markdown_to_speech_text
+from ruby.core.voice_pipeline import PlaybackQueue, SpeechChunker, TTSSynthesisQueue
 from ruby.setup.doctor import run_doctor
 from ruby.setup.init_wizard import InitWizard
 from ruby.setup.model_discovery import discover_ollama_models, discover_whisper_models
@@ -32,8 +37,7 @@ AVAILABLE_COMMANDS = ("run", "init", "doctor", "models", "config")
 
 
 STATE_READY = "[Ready]"
-STATE_RECORDING = "[Recording]"
-STATE_RECORDED = "[Recorded]"
+STATE_LISTENING = "[Listening]"
 STATE_TRANSCRIBING = "[Transcribing]"
 STATE_THINKING = "[Thinking]"
 STATE_SPEAKING = "[Speaking]"
@@ -41,6 +45,7 @@ STATE_DONE = "[Done]"
 STATE_INTERRUPTED = "[Interrupted]"
 
 ControlPollFn = Callable[[float], str | None]
+_WORD_TOKEN = re.compile(r"\b[\w']+\b")
 
 
 def _print_state(label: str, message: str = "") -> None:
@@ -56,6 +61,67 @@ def _print_debug(context: AppContext, label: str, details: str) -> None:
     print(f"[Debug] {label}: {details}")
 
 
+def _latency_logging_enabled(context: AppContext) -> bool:
+    return bool(context.settings.debug and context.settings.audio.latency_debug)
+
+
+def _print_latency(context: AppContext, label: str, elapsed_ms: float) -> None:
+    if not _latency_logging_enabled(context):
+        return
+    print(f"[Latency] {label}: {elapsed_ms:.1f}ms")
+
+
+def _normalize_for_speech(text: str) -> str:
+    normalized = markdown_to_speech_text(text)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _compute_unseen_residual_text(final_text: str, emitted_captions: list[str]) -> str:
+    final_speech = _normalize_for_speech(final_text)
+    if not final_speech:
+        return ""
+
+    emitted_speech = _normalize_for_speech(" ".join(emitted_captions))
+    if not emitted_speech:
+        return final_speech
+    if final_speech in emitted_speech:
+        return ""
+    if final_speech.startswith(emitted_speech):
+        return final_speech[len(emitted_speech) :].strip()
+
+    final_tokens = [token.group(0).lower() for token in _WORD_TOKEN.finditer(final_speech)]
+    emitted_tokens = [token.group(0).lower() for token in _WORD_TOKEN.finditer(emitted_speech)]
+    if not final_tokens:
+        return ""
+
+    overlap = 0
+    max_overlap = min(len(final_tokens), len(emitted_tokens))
+    for candidate in range(1, max_overlap + 1):
+        if emitted_tokens[-candidate:] == final_tokens[:candidate]:
+            overlap = candidate
+
+    if overlap >= len(final_tokens):
+        return ""
+    if overlap > 0:
+        return " ".join(final_tokens[overlap:])
+    return final_speech
+
+
+def _estimate_audio_duration_seconds(audio_path: Path, fallback_text: str) -> float:
+    try:
+        with wave.open(str(audio_path), "rb") as wav_file:
+            frame_rate = wav_file.getframerate()
+            frame_count = wav_file.getnframes()
+            if frame_rate > 0 and frame_count > 0:
+                return max(frame_count / float(frame_rate), 0.08)
+    except Exception:  # noqa: BLE001
+        pass
+
+    normalized = _normalize_for_speech(fallback_text)
+    chars = max(len(normalized), 1)
+    return min(max(chars / 24.0, 0.15), 4.0)
+
+
 def _confirm_action(prompt: str) -> bool:
     choice = input(f"{prompt} [y/N]: ").strip().lower()
     return choice in {"y", "yes"}
@@ -68,6 +134,7 @@ def _print_help_commands() -> None:
     print("  /clear    Clear in-session conversation history")
     print("  /status   Show active providers and models")
     print("  /quit     Exit the session")
+    print("  Ctrl+C or Esc while processing to cancel current turn")
 
 
 def _print_status(context: AppContext) -> None:
@@ -300,7 +367,7 @@ def _run_voice_request(
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     command_path = PROJECT_ROOT / "recordings" / f"command-{timestamp}.wav"
 
-    _print_state(STATE_RECORDING)
+    _print_state(STATE_LISTENING)
 
     def _record_audio() -> Any:
         return context.recorder.record(
@@ -331,7 +398,7 @@ def _run_voice_request(
         _print_state(STATE_READY)
         return True
 
-    _print_state(STATE_RECORDED)
+    speech_ended_at = time.monotonic()
     _print_state(STATE_TRANSCRIBING)
 
     def _transcribe() -> Any:
@@ -348,17 +415,386 @@ def _run_voice_request(
         _print_debug(context, "transcription", str(exc))
         return False
 
+    transcript_ready_at = time.monotonic()
+    _print_latency(
+        context,
+        "speech_end_to_transcript",
+        (transcript_ready_at - speech_ended_at) * 1000.0,
+    )
+
     if interrupted or cancel_event.is_set() or not transcript:
         _print_state(STATE_INTERRUPTED)
         _print_state(STATE_READY)
         return True
 
-    return _run_text_request(
-        context,
-        transcript,
-        cancel_event=cancel_event,
-        control_poll_fn=control_poll,
+    print(f"You said: {transcript}")
+    _print_state(STATE_THINKING)
+
+    first_token_at: float | None = None
+    first_chunk_at: float | None = None
+    first_tts_audio_at: float | None = None
+    playback_started_at: float | None = None
+    playback_stopped_at: float | None = None
+    stream_completed_at: float | None = None
+    barge_in_detected_at: float | None = None
+    barge_in_guard_seconds = 0.02
+    barge_in_guard_until = 0.0
+    emitted_captions: list[str] = []
+    acknowledgement_chunk: str | None = None
+    acknowledgement_chunk_handled = False
+    response_chunk_seen = False
+    caption_thread: threading.Thread | None = None
+    caption_stop_event = threading.Event()
+    caption_flush_event = threading.Event()
+    caption_lock = threading.Lock()
+
+    monitor_stop_event = threading.Event()
+    monitor_thread: threading.Thread | None = None
+    control_monitor_stop_event = threading.Event()
+    control_monitor_thread: threading.Thread | None = None
+
+    def _stop_barge_in_monitor() -> None:
+        nonlocal monitor_thread
+        monitor_stop_event.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=0.2)
+            monitor_thread = None
+
+    def _stop_control_monitor() -> None:
+        nonlocal control_monitor_thread
+        control_monitor_stop_event.set()
+        if control_monitor_thread is not None:
+            control_monitor_thread.join(timeout=0.2)
+            control_monitor_thread = None
+
+    def _stop_caption_renderer(*, flush: bool) -> None:
+        nonlocal caption_thread
+        if caption_thread is None:
+            return
+        if flush:
+            caption_flush_event.set()
+        else:
+            caption_stop_event.set()
+        caption_thread.join(timeout=0.5)
+        caption_thread = None
+
+    def _start_caption_renderer(caption: str, audio_path: Path) -> None:
+        nonlocal caption_thread
+
+        _stop_caption_renderer(flush=True)
+
+        if not caption:
+            return
+
+        if not sys.stdout.isatty():
+            print(f"Ruby: {caption}")
+            emitted_captions.append(caption)
+            return
+
+        caption_stop_event.clear()
+        caption_flush_event.clear()
+        duration_seconds = _estimate_audio_duration_seconds(audio_path, caption)
+
+        def _render() -> None:
+            interval = min(max(duration_seconds / max(len(caption), 1), 0.008), 0.08)
+            index = 0
+            with caption_lock:
+                print("Ruby: ", end="", flush=True)
+
+            while index < len(caption):
+                if cancel_event.is_set() or caption_stop_event.is_set():
+                    break
+                if caption_flush_event.is_set():
+                    remainder = caption[index:]
+                    if remainder:
+                        with caption_lock:
+                            print(remainder, end="", flush=True)
+                    index = len(caption)
+                    break
+                with caption_lock:
+                    print(caption[index], end="", flush=True)
+                index += 1
+                time.sleep(interval)
+
+            with caption_lock:
+                print()
+            if index >= len(caption):
+                emitted_captions.append(caption)
+
+        caption_thread = threading.Thread(target=_render, daemon=True)
+        caption_thread.start()
+
+    def _start_control_monitor() -> None:
+        nonlocal control_monitor_thread
+
+        if control_monitor_thread is not None and control_monitor_thread.is_alive():
+            return
+
+        control_monitor_stop_event.clear()
+
+        def _monitor_controls() -> None:
+            while not cancel_event.is_set() and not control_monitor_stop_event.is_set():
+                try:
+                    signal = control_poll(0.05)
+                except KeyboardInterrupt:
+                    cancel_event.set()
+                    return
+
+                if signal == "cancel":
+                    cancel_event.set()
+                    return
+
+        control_monitor_thread = threading.Thread(target=_monitor_controls, daemon=True)
+        control_monitor_thread.start()
+
+    def _start_barge_in_monitor() -> None:
+        nonlocal monitor_thread, monitor_stop_event, barge_in_detected_at, barge_in_guard_until
+
+        if not context.settings.audio.barge_in_enabled:
+            return
+
+        wait_for_speech = getattr(context.recorder, "wait_for_speech", None)
+        if not callable(wait_for_speech):
+            return
+
+        _stop_barge_in_monitor()
+        monitor_stop_event = threading.Event()
+        barge_in_guard_until = max(barge_in_guard_until, time.monotonic() + barge_in_guard_seconds)
+
+        def _monitor() -> None:
+            nonlocal barge_in_detected_at
+            try:
+                detected = wait_for_speech(
+                    cancel_event=cancel_event,
+                    stop_event=monitor_stop_event,
+                    energy_threshold=context.settings.audio.barge_in_energy_threshold,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _print_debug(context, "barge_in", str(exc))
+                return
+            detection_time = time.monotonic()
+            if (
+                detected
+                and not cancel_event.is_set()
+                and not monitor_stop_event.is_set()
+                and detection_time >= barge_in_guard_until
+            ):
+                barge_in_detected_at = time.monotonic()
+                cancel_event.set()
+
+        monitor_thread = threading.Thread(target=_monitor, daemon=True)
+        monitor_thread.start()
+
+    def _on_first_token(_latency_ms: float) -> None:
+        nonlocal first_token_at
+        if first_token_at is None:
+            first_token_at = time.monotonic()
+
+    def _on_first_audio_ready() -> None:
+        nonlocal first_tts_audio_at
+        if first_tts_audio_at is None:
+            first_tts_audio_at = time.monotonic()
+
+    def _on_playback_start() -> None:
+        nonlocal playback_started_at
+        if playback_started_at is None:
+            playback_started_at = time.monotonic()
+            _print_state(STATE_SPEAKING)
+
+    def _on_playback_stop() -> None:
+        nonlocal playback_stopped_at
+        playback_stopped_at = time.monotonic()
+
+    def _on_chunk_start(text: str, audio_path: Path) -> None:
+        nonlocal acknowledgement_chunk_handled, response_chunk_seen
+        caption = text.strip()
+        _start_caption_renderer(caption, audio_path)
+
+        if (
+            acknowledgement_chunk is not None
+            and not acknowledgement_chunk_handled
+            and caption == acknowledgement_chunk
+        ):
+            acknowledgement_chunk_handled = True
+            return
+
+        if not response_chunk_seen:
+            response_chunk_seen = True
+            return
+
+        _start_barge_in_monitor()
+
+    def _on_chunk_end() -> None:
+        nonlocal barge_in_guard_until
+        _stop_caption_renderer(flush=True)
+        barge_in_guard_until = max(barge_in_guard_until, time.monotonic() + barge_in_guard_seconds)
+        _stop_barge_in_monitor()
+
+    chunker = SpeechChunker(
+        min_chunk_words=context.settings.audio.min_chunk_words,
+        max_chunk_words=context.settings.audio.max_chunk_words,
+        max_chunk_wait_ms=context.settings.audio.max_chunk_wait_ms,
     )
+    tts_queue = TTSSynthesisQueue(
+        tts_provider=context.assistant.tts_provider,
+        responses_dir=PROJECT_ROOT / "responses",
+        cancel_event=cancel_event,
+        on_first_audio_ready=_on_first_audio_ready,
+    )
+    playback_queue = PlaybackQueue(
+        player=context.player,
+        source_queue=tts_queue.output_queue,
+        cancel_event=cancel_event,
+        on_playback_start=_on_playback_start,
+        on_playback_stop=_on_playback_stop,
+        on_chunk_start=_on_chunk_start,
+        on_chunk_end=_on_chunk_end,
+    )
+
+    tts_queue.start()
+    playback_queue.start()
+
+    if context.assistant.should_acknowledge_for_voice(transcript):
+        acknowledgement = context.assistant.acknowledgement_for_voice(transcript)
+        acknowledgement_chunk = acknowledgement.strip() or None
+        tts_queue.enqueue(acknowledgement)
+
+    full_parts: list[str] = []
+    stream_queue: queue.Queue[str | RubyError | None] = queue.Queue()
+
+    def _produce_stream() -> None:
+        try:
+            for fragment in context.assistant.stream_voice_response(
+                transcript,
+                cancel_event=cancel_event,
+                on_first_token=_on_first_token,
+            ):
+                if cancel_event.is_set():
+                    break
+                stream_queue.put(fragment)
+        except RubyError as exc:
+            stream_queue.put(exc)
+        finally:
+            stream_queue.put(None)
+
+    stream_thread = threading.Thread(target=_produce_stream, daemon=True)
+    stream_thread.start()
+    _start_control_monitor()
+
+    stream_finished = False
+    try:
+        while not stream_finished and not cancel_event.is_set():
+            try:
+                item = stream_queue.get(timeout=0.05)
+            except queue.Empty:
+                for chunk in chunker.drain_on_timeout(now_monotonic=time.monotonic()):
+                    if first_chunk_at is None:
+                        first_chunk_at = time.monotonic()
+                    tts_queue.enqueue(chunk)
+                continue
+
+            if item is None:
+                stream_completed_at = time.monotonic()
+                stream_finished = True
+                break
+
+            if isinstance(item, RubyError):
+                _print_llm_error(context, item)
+                cancel_event.set()
+                break
+
+            full_parts.append(item)
+            for chunk in chunker.feed(item):
+                if first_chunk_at is None:
+                    first_chunk_at = time.monotonic()
+                tts_queue.enqueue(chunk)
+
+        if not cancel_event.is_set():
+            for chunk in chunker.drain_on_timeout(now_monotonic=time.monotonic()):
+                if first_chunk_at is None:
+                    first_chunk_at = time.monotonic()
+                tts_queue.enqueue(chunk)
+            for chunk in chunker.flush():
+                if first_chunk_at is None:
+                    first_chunk_at = time.monotonic()
+                tts_queue.enqueue(chunk)
+    finally:
+        _stop_control_monitor()
+        _stop_caption_renderer(flush=False)
+        stream_thread.join(timeout=0.2)
+        tts_queue.close()
+        tts_queue.join()
+        playback_queue.join()
+        _stop_barge_in_monitor()
+
+    final_text = "".join(full_parts).strip()
+    interrupted_final = cancel_event.is_set()
+    response = context.assistant.finalize_voice_turn(
+        transcript,
+        final_text,
+        interrupted=interrupted_final,
+    )
+
+    if response.text and not interrupted_final:
+        if not emitted_captions:
+            print(f"Ruby: {response.text}")
+        else:
+            residual_text = _compute_unseen_residual_text(response.text, emitted_captions)
+            if residual_text:
+                print(f"Ruby: {residual_text}")
+
+    if first_token_at is not None:
+        _print_latency(
+            context,
+            "transcript_to_first_token",
+            (first_token_at - transcript_ready_at) * 1000.0,
+        )
+    if first_token_at is not None and first_chunk_at is not None:
+        _print_latency(
+            context,
+            "first_token_to_first_chunk",
+            (first_chunk_at - first_token_at) * 1000.0,
+        )
+    if first_chunk_at is not None and first_tts_audio_at is not None:
+        _print_latency(
+            context,
+            "first_chunk_to_first_tts_audio",
+            (first_tts_audio_at - first_chunk_at) * 1000.0,
+        )
+    if first_tts_audio_at is not None and playback_started_at is not None:
+        _print_latency(
+            context,
+            "first_tts_audio_to_playback_start",
+            (playback_started_at - first_tts_audio_at) * 1000.0,
+        )
+    if playback_started_at is not None and stream_completed_at is not None:
+        _print_latency(
+            context,
+            "playback_start_to_stream_complete",
+            (stream_completed_at - playback_started_at) * 1000.0,
+        )
+        _print_debug(
+            context,
+            "overlap",
+            (
+                "playback_started_before_stream_complete="
+                f"{str(playback_started_at < stream_completed_at).lower()}"
+            ),
+        )
+    if barge_in_detected_at is not None and playback_stopped_at is not None:
+        _print_latency(
+            context,
+            "barge_in_to_audio_stop",
+            (playback_stopped_at - barge_in_detected_at) * 1000.0,
+        )
+
+    if interrupted_final:
+        _print_state(STATE_INTERRUPTED)
+        _print_state(STATE_READY)
+        return True
+
+    _print_state(STATE_DONE)
+    return False
 
 
 def _interactive_loop(context: AppContext) -> int:
